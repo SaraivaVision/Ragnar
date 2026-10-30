@@ -303,3 +303,4 @@ data/engagement_playbooks/
 
 # Ragnar OS image build (pi-gen checkout + deploy artifacts)
 os-image/.pi-gen/
+.venv/
