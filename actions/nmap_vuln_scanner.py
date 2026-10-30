@@ -37,6 +37,7 @@ if parent_dir not in sys.path:
 import re
 import json
 import subprocess
+import shutil
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
@@ -51,6 +52,11 @@ from nmap_logger import nmap_logger
 from db_manager import get_db
 
 logger = Logger(name="nmap_vuln_scanner.py", level=logging.INFO)
+
+
+class NucleiNotAvailableError(RuntimeError):
+    """Raised when the nuclei binary is required for the second stage but is
+    not installed / not executable. Carries a clear, actionable message."""
 
 b_class = "NmapVulnScanner"
 b_module = "nmap_vuln_scanner"
@@ -410,6 +416,11 @@ class NmapVulnScanner:
             # If vulnerabilities are deleted via web UI and scan finds them again,
             # they will be automatically re-added here
             self.feed_to_network_intelligence(ip, port_vulnerabilities, port_services)
+
+            # Second stage (optional): nuclei CVE correlation by service version.
+            # Guarded by config 'nuclei_stage_enabled' (default off); never
+            # raises — a missing binary or scan error only logs and is skipped.
+            self._run_nuclei_second_stage(ip, hostname, mac, result.stdout)
             
             # CRITICAL: Update scanned ports history for incremental scanning
             # This ensures we don't re-scan the same ports on subsequent runs
@@ -685,6 +696,316 @@ class NmapVulnScanner:
 
         except Exception as e:
             logger.error(f"Error feeding vulnerabilities to network intelligence: {e}")
+
+    # ==================================================================
+    # Second stage: Nuclei CVE correlation by service version
+    # ==================================================================
+    # After nmap -sV identifies services and versions, this stage runs nuclei
+    # against those services and correlates each nuclei finding (which carries
+    # CVE ids + the matched port) back to the service/version nmap saw on that
+    # port. Detection/assessment only — nuclei templates report exposure, they
+    # do not launch brute force or exfiltration. Off by default; enable with
+    # config 'nuclei_stage_enabled' (and have the nuclei binary installed).
+
+    NUCLEI_SEVERITIES = "low,medium,high,critical"
+
+    def _find_nuclei_binary(self) -> Optional[str]:
+        """Resolve the nuclei binary: config 'nuclei_path' override, else PATH.
+        Returns the path or None."""
+        configured = None
+        try:
+            configured = self.shared_data.config.get("nuclei_path")
+        except Exception:  # noqa: BLE001
+            configured = None
+        if configured and os.path.exists(configured):
+            return configured
+        return shutil.which("nuclei")
+
+    @staticmethod
+    def _port_from_matched_at(matched_at: str) -> Optional[str]:
+        """Pull the port out of a nuclei 'matched-at' value such as
+        'https://10.0.0.5:8443/path' or '10.0.0.5:22'. Returns None if absent."""
+        if not matched_at:
+            return None
+        value = matched_at.strip()
+        if "://" in value:
+            value = value.split("://", 1)[1]
+        # strip any path/query
+        value = value.split("/", 1)[0].split("?", 1)[0]
+        # IPv6 literal [::1]:443
+        if value.startswith("[") and "]" in value:
+            after = value.split("]", 1)[1]
+            if after.startswith(":") and after[1:].isdigit():
+                return after[1:]
+            return None
+        if ":" in value:
+            candidate = value.rsplit(":", 1)[1]
+            if candidate.isdigit():
+                return candidate
+        return None
+
+    def parse_service_versions(self, nmap_output: str) -> Dict[str, Dict[str, str]]:
+        """Parse `nmap -sV` output into {port: {service, product, version, raw}}.
+
+        Reads the open-port lines (e.g. '22/tcp open ssh OpenSSH 9.2p1 Debian').
+        """
+        services: Dict[str, Dict[str, str]] = {}
+        for raw_line in (nmap_output or "").splitlines():
+            line = raw_line.strip()
+            if "/tcp" not in line and "/udp" not in line:
+                continue
+            if "open" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            port = parts[0].split("/")[0]
+            if not port.isdigit():
+                continue
+            service = parts[2] if len(parts) >= 3 else "unknown"
+            version_info = " ".join(parts[3:]).strip() if len(parts) > 3 else ""
+            services[port] = {
+                "service": service,
+                "product": version_info.split(" ")[0] if version_info else "",
+                "version": version_info,
+                "raw": line,
+            }
+        return services
+
+    def _nuclei_targets_from_services(self, ip: str,
+                                      port_services: Dict[str, Dict[str, str]]
+                                      ) -> List[str]:
+        """Build nuclei '-u' targets per open port, choosing http(s) for web
+        services and host:port otherwise. Falls back to the bare host."""
+        targets: List[str] = []
+        for port, info in port_services.items():
+            service = (info.get("service") or "").lower()
+            try:
+                pnum = int(port)
+            except (ValueError, TypeError):
+                continue
+            if "https" in service or "ssl" in service or pnum in (443, 8443):
+                targets.append(f"https://{ip}:{pnum}")
+            elif "http" in service or pnum in (80, 8080, 8000):
+                targets.append(f"http://{ip}:{pnum}")
+            else:
+                targets.append(f"{ip}:{pnum}")
+        if not targets:
+            targets.append(ip)
+        return targets
+
+    def build_nuclei_command(self, nuclei_path: str, targets: List[str],
+                             severity: Optional[str] = None,
+                             timeout_per_template: int = 10,
+                             rate_limit: int = 50) -> List[str]:
+        """Build the nuclei argv for the second stage (JSONL output, bounded
+        rate). One '-u' per target."""
+        cmd = [
+            nuclei_path,
+            "-jsonl",
+            "-silent",
+            "-no-interactsh",
+            "-severity", severity or self.NUCLEI_SEVERITIES,
+            "-timeout", str(timeout_per_template),
+            "-retries", "1",
+            "-rate-limit", str(rate_limit),
+        ]
+        for target in targets:
+            cmd += ["-u", target]
+        return cmd
+
+    def parse_nuclei_jsonl(self, output: str) -> List[Dict]:
+        """Parse nuclei -jsonl stdout into normalized finding dicts.
+
+        Tolerates non-JSON / malformed lines (skips them). Extracts CVE ids
+        from both info.tags and info.classification.cve-id.
+        """
+        findings: List[Dict] = []
+        for raw_line in (output or "").splitlines():
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except (ValueError, json.JSONDecodeError):
+                logger.debug("Skipping malformed nuclei JSON line")
+                continue
+            if not isinstance(data, dict):
+                continue
+            info = data.get("info") or {}
+            classification = info.get("classification") or {}
+            cve_ids: List[str] = []
+            for tag in (info.get("tags") or []):
+                if isinstance(tag, str) and tag.upper().startswith("CVE-"):
+                    cve_ids.append(tag.upper())
+            cve_field = classification.get("cve-id") or []
+            if isinstance(cve_field, str):
+                cve_field = [cve_field]
+            for cid in cve_field:
+                if isinstance(cid, str):
+                    cve_ids.append(cid.upper())
+            port = data.get("port")
+            port = str(port) if port is not None else None
+            findings.append({
+                "template_id": data.get("template-id", ""),
+                "name": info.get("name", ""),
+                "severity": (info.get("severity") or "unknown").lower(),
+                "cve_ids": sorted(set(cve_ids)),
+                "host": data.get("host", ""),
+                "matched_at": data.get("matched-at", ""),
+                "port": port,
+                "cvss": classification.get("cvss-score"),
+            })
+        return findings
+
+    def correlate_cves_by_service(self, nuclei_findings: List[Dict],
+                                  port_services: Dict[str, Dict[str, str]]
+                                  ) -> List[Dict]:
+        """Attach each nuclei finding to the service/version nmap saw on its
+        port, producing correlated CVE records."""
+        correlated: List[Dict] = []
+        for finding in nuclei_findings:
+            port = finding.get("port") or self._port_from_matched_at(
+                finding.get("matched_at", ""))
+            svc = port_services.get(str(port)) if port else None
+            svc = svc or {}
+            correlated.append({
+                "port": str(port) if port else "",
+                "service": svc.get("service", "unknown"),
+                "product": svc.get("product", ""),
+                "version": svc.get("version", ""),
+                "cve_ids": finding.get("cve_ids", []),
+                "severity": finding.get("severity", "unknown"),
+                "template_id": finding.get("template_id", ""),
+                "name": finding.get("name", ""),
+                "cvss": finding.get("cvss"),
+                "source": "nuclei",
+            })
+        return correlated
+
+    def run_nuclei_stage(self, ip: str,
+                         port_services: Dict[str, Dict[str, str]],
+                         timeout: int = 600,
+                         nuclei_path: Optional[str] = None) -> List[Dict]:
+        """Run the nuclei second stage for one host and return correlated CVE
+        findings.
+
+        Raises NucleiNotAvailableError (clear message) if the binary is
+        missing. Never raises on a scan/timeout failure — it logs and returns
+        whatever partial output parsed. Fully external: unit-tested with
+        subprocess mocked (no real nuclei is ever run in tests).
+        """
+        nuclei_path = nuclei_path or self._find_nuclei_binary()
+        if not nuclei_path:
+            raise NucleiNotAvailableError(
+                "nuclei binary not found. Install nuclei or set config "
+                "'nuclei_path' to enable second-stage CVE correlation.")
+
+        targets = self._nuclei_targets_from_services(ip, port_services)
+        cmd = self.build_nuclei_command(nuclei_path, targets)
+        logger.info(f"🧪 Nuclei second stage for {ip}: {len(targets)} target(s)")
+
+        stdout = ""
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=timeout)
+            stdout = result.stdout or ""
+            if result.returncode != 0 and not stdout:
+                logger.warning(
+                    f"nuclei exited {result.returncode} for {ip}: "
+                    f"{(result.stderr or '').strip()[:300]}")
+        except subprocess.TimeoutExpired as exc:
+            logger.warning(
+                f"nuclei timed out after {timeout}s for {ip}; using partial output")
+            partial = exc.stdout
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            stdout = partial or ""
+        except FileNotFoundError as exc:
+            raise NucleiNotAvailableError(
+                f"nuclei binary not executable at {nuclei_path}: {exc}")
+
+        findings = self.parse_nuclei_jsonl(stdout)
+        correlated = self.correlate_cves_by_service(findings, port_services)
+        logger.info(
+            f"🧪 Nuclei second stage for {ip}: {len(correlated)} finding(s) correlated")
+        return correlated
+
+    def _feed_nuclei_findings(self, ip: str, hostname: str, mac: str,
+                              correlated: List[Dict]) -> None:
+        """Feed correlated nuclei CVEs to Network Intelligence and persist a
+        summary to the SQLite host record."""
+        if not correlated:
+            return
+        ni = getattr(self.shared_data, "network_intelligence", None)
+        for finding in correlated:
+            identifiers = finding.get("cve_ids") or (
+                [finding.get("template_id")] if finding.get("template_id") else [])
+            if ni:
+                port_val = finding.get("port", "")
+                port_int = int(port_val) if str(port_val).isdigit() else 0
+                for identifier in identifiers:
+                    if not identifier:
+                        continue
+                    try:
+                        ni.add_vulnerability(
+                            host=ip,
+                            port=port_int,
+                            service=finding.get("service", "unknown"),
+                            vulnerability=identifier,
+                            severity=finding.get("severity", "unknown"),
+                            details={
+                                "source": "nuclei",
+                                "template_id": finding.get("template_id", ""),
+                                "version": finding.get("version", ""),
+                                "name": finding.get("name", ""),
+                                "cvss": finding.get("cvss"),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"nuclei feed to NI failed: {exc}")
+
+        try:
+            if mac and mac.lower() not in ["unknown", "00:00:00:00:00:00", ""]:
+                entries = []
+                for finding in correlated:
+                    ids = ",".join(finding.get("cve_ids") or []) or \
+                        finding.get("template_id", "")
+                    if not ids:
+                        continue
+                    entries.append(
+                        f"{finding.get('port', '')}/{finding.get('service', '')} "
+                        f"[{finding.get('severity', '')}] (nuclei): {ids}")
+                summary = "; ".join(sorted(set(entries)))
+                if summary:
+                    self.db.upsert_host(mac=mac.lower().strip(), ip=ip,
+                                        vulnerabilities=summary)
+                    logger.info(
+                        f"✅ Nuclei: persisted {len(entries)} correlated "
+                        f"finding(s) for {mac} ({ip})")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"nuclei DB persist failed for {ip}: {exc}")
+
+    def _run_nuclei_second_stage(self, ip: str, hostname: str, mac: str,
+                                 nmap_output: str) -> List[Dict]:
+        """Guarded entry point called from scan_vulnerabilities. Returns the
+        correlated findings (empty on skip/missing binary) and never raises."""
+        try:
+            enabled = bool(self.shared_data.config.get("nuclei_stage_enabled", False))
+        except Exception:  # noqa: BLE001
+            enabled = False
+        if not enabled:
+            return []
+        try:
+            port_services = self.parse_service_versions(nmap_output)
+            correlated = self.run_nuclei_stage(ip, port_services)
+            self._feed_nuclei_findings(ip, hostname, mac, correlated)
+            return correlated
+        except NucleiNotAvailableError as exc:
+            logger.warning(f"Nuclei second stage skipped for {ip}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Nuclei second stage error for {ip}: {exc}")
+        return []
 
     def update_database_detailed_vulnerabilities(self, mac, ip, port_vulnerabilities, port_services):
         """Persist detailed vulnerability information to SQLite database (SINGLE SOURCE OF TRUTH)"""
