@@ -387,6 +387,439 @@ class NetworkScanner:
         return all_hosts
 
     # ------------------------------------------------------------------
+    # Passive network discovery (mDNS + DHCP snooping)
+    # ------------------------------------------------------------------
+    # Pure listening: these helpers only *observe* broadcast/multicast traffic
+    # already present on the LAN (mDNS announcements on 224.0.0.251:5353 and
+    # DHCP Request/ACK on ports 67/68). They never transmit a probe, run a
+    # port scan or touch a host directly — so they are safe to run before the
+    # active ARP/ping sweep and add no traffic of their own. Results are folded
+    # into the same SQLite host store (``self.db``) used by run_arp_scan.
+    #
+    # Data flow:
+    #   mDNS  -> hostname <-> IP   (no MAC on the wire; reconciled via pseudo-MAC)
+    #   DHCP  -> host -> IP -> MAC (ACK yiaddr / Request requested-IP + chaddr)
+
+    DHCP_REQUEST = 3
+    DHCP_ACK = 5
+    MDNS_GROUP = '224.0.0.251'
+    MDNS_PORT = 5353
+
+    @staticmethod
+    def _bytes_to_ip(raw):
+        """Render 4 raw bytes as a dotted-quad IPv4, or '' if not 4 bytes."""
+        if not raw or len(raw) != 4:
+            return ''
+        return '.'.join(str(b) for b in raw)
+
+    @staticmethod
+    def _pseudo_mac_for_ip(ip):
+        """Deterministic pseudo-MAC for a host seen without a real MAC.
+
+        Mirrors the scheme the ping sweep uses (``00:00:<octets>``) so
+        update_netkb can later reconcile it against a real MAC. Returns '' on
+        malformed input.
+        """
+        try:
+            octets = [int(part) for part in str(ip).split('.')]
+        except (ValueError, AttributeError):
+            return ''
+        if len(octets) != 4 or any(o < 0 or o > 255 for o in octets):
+            return ''
+        return "00:00:{:02x}:{:02x}:{:02x}:{:02x}".format(*octets)
+
+    # ---- mDNS parsing -------------------------------------------------
+
+    @staticmethod
+    def _dns_read_name(data, offset):
+        """Decode a (possibly compressed) DNS name at ``offset``.
+
+        Returns ``(name, next_offset)`` where ``next_offset`` is the position
+        in the original buffer right after the name (the first compression
+        pointer freezes advancement, per RFC 1035).
+        """
+        labels = []
+        jumped = False
+        next_offset = offset
+        pos = offset
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 128 or pos < 0 or pos >= len(data):
+                break
+            length = data[pos]
+            if length == 0:
+                pos += 1
+                if not jumped:
+                    next_offset = pos
+                break
+            if (length & 0xC0) == 0xC0:
+                if pos + 1 >= len(data):
+                    break
+                pointer = ((length & 0x3F) << 8) | data[pos + 1]
+                if not jumped:
+                    next_offset = pos + 2
+                jumped = True
+                pos = pointer
+                continue
+            pos += 1
+            if pos + length > len(data):
+                break
+            labels.append(data[pos:pos + length].decode('utf-8', 'replace'))
+            pos += length
+        return '.'.join(labels), next_offset
+
+    @classmethod
+    def _parse_mdns_packet(cls, data):
+        """Parse an observed mDNS/DNS message into A and PTR records.
+
+        Pure byte parsing with no side effects. Returns
+        ``{'a_records': [(name, ip), ...], 'ptr_records': [(name, target), ...]}``.
+        Malformed input yields empty lists rather than raising.
+        """
+        result = {'a_records': [], 'ptr_records': []}
+        try:
+            if not data or len(data) < 12:
+                return result
+            qdcount = int.from_bytes(data[4:6], 'big')
+            ancount = int.from_bytes(data[6:8], 'big')
+            nscount = int.from_bytes(data[8:10], 'big')
+            arcount = int.from_bytes(data[10:12], 'big')
+            offset = 12
+            for _ in range(qdcount):
+                _, offset = cls._dns_read_name(data, offset)
+                offset += 4  # qtype (2) + qclass (2)
+                if offset > len(data):
+                    return result
+            for _ in range(ancount + nscount + arcount):
+                name, offset = cls._dns_read_name(data, offset)
+                if offset + 10 > len(data):
+                    break
+                rtype = int.from_bytes(data[offset:offset + 2], 'big')
+                rdlength = int.from_bytes(data[offset + 8:offset + 10], 'big')
+                rdata_start = offset + 10
+                rdata_end = rdata_start + rdlength
+                if rdata_end > len(data):
+                    break
+                if rtype == 1 and rdlength == 4:  # A record
+                    ip = cls._bytes_to_ip(data[rdata_start:rdata_end])
+                    result['a_records'].append((name.rstrip('.'), ip))
+                elif rtype == 12:  # PTR record
+                    target, _ = cls._dns_read_name(data, rdata_start)
+                    result['ptr_records'].append(
+                        (name.rstrip('.'), target.rstrip('.')))
+                offset = rdata_end
+        except Exception:  # noqa: BLE001 - parser must never raise on junk
+            return result
+        return result
+
+    @classmethod
+    def _mdns_hosts_from_packet(cls, data):
+        """Extract ``{ip: {mac, vendor, hostname, source}}`` from mDNS A records.
+
+        mDNS carries no MAC on the wire, so ``mac`` is left blank and filled in
+        later from the DB (or a pseudo-MAC) at merge time.
+        """
+        hosts = {}
+        parsed = cls._parse_mdns_packet(data)
+        for hostname, ip in parsed.get('a_records', []):
+            if not cls._is_valid_ip(ip) or ip == '0.0.0.0':
+                continue
+            hosts[ip] = {'mac': '', 'vendor': '', 'hostname': hostname,
+                         'source': 'mdns'}
+        return hosts
+
+    # ---- DHCP parsing -------------------------------------------------
+
+    @classmethod
+    def _parse_dhcp_packet(cls, data):
+        """Parse an observed BOOTP/DHCP packet (pure, never raises).
+
+        Returns ``{msg_type, mac, ciaddr, yiaddr, requested_ip, hostname}``.
+        ``msg_type`` is the DHCP option-53 value (3=Request, 5=ACK) or None.
+        """
+        info = {'msg_type': None, 'mac': '', 'ciaddr': '', 'yiaddr': '',
+                'requested_ip': '', 'hostname': ''}
+        try:
+            if not data or len(data) < 240:
+                return info
+            # Require the DHCP magic cookie before trusting any field, so stray
+            # BOOTP/UDP traffic is not mis-read as a DHCP host mapping.
+            if data[236:240] != b'\x63\x82\x53\x63':
+                return info
+            hlen = data[2]
+            info['ciaddr'] = cls._bytes_to_ip(data[12:16])
+            info['yiaddr'] = cls._bytes_to_ip(data[16:20])
+            mac_len = hlen if 1 <= hlen <= 16 else 6
+            chaddr = data[28:28 + mac_len]
+            if len(chaddr) >= 6:
+                info['mac'] = ':'.join('{:02x}'.format(b) for b in chaddr[:6])
+            pos = 240
+            while pos < len(data):
+                opt = data[pos]
+                if opt == 255:  # End
+                    break
+                if opt == 0:  # Pad
+                    pos += 1
+                    continue
+                if pos + 1 >= len(data):
+                    break
+                length = data[pos + 1]
+                val = data[pos + 2:pos + 2 + length]
+                if len(val) < length:
+                    break
+                if opt == 53 and length >= 1:      # DHCP message type
+                    info['msg_type'] = val[0]
+                elif opt == 50 and length == 4:    # Requested IP address
+                    info['requested_ip'] = cls._bytes_to_ip(val)
+                elif opt == 12 and length >= 1:    # Host name
+                    info['hostname'] = val.decode('utf-8', 'replace').rstrip('.')
+                pos += 2 + length
+        except Exception:  # noqa: BLE001 - parser must never raise on junk
+            return info
+        return info
+
+    @classmethod
+    def _dhcp_host_from_packet(cls, data):
+        """Fold a DHCP ACK/Request into ``(ip, {mac, vendor, hostname, source})``.
+
+        Returns None when the packet carries no usable host->IP->MAC mapping.
+        """
+        info = cls._parse_dhcp_packet(data)
+        mac = (info.get('mac') or '').lower()
+        if not cls._is_valid_mac(mac) or mac == '00:00:00:00:00:00':
+            return None
+        msg_type = info.get('msg_type')
+        if msg_type == cls.DHCP_ACK:
+            ip = info.get('yiaddr') or info.get('ciaddr')
+        elif msg_type == cls.DHCP_REQUEST:
+            ip = info.get('requested_ip') or info.get('ciaddr')
+        else:
+            ip = info.get('yiaddr') or info.get('requested_ip')
+        if not ip or not cls._is_valid_ip(ip) or ip == '0.0.0.0':
+            return None
+        return ip, {'mac': mac, 'vendor': '', 'hostname': info.get('hostname', ''),
+                    'source': 'dhcp'}
+
+    # ---- accumulation + persistence -----------------------------------
+
+    @staticmethod
+    def _merge_passive_host(hosts, ip, meta):
+        """Fold one observed record into the accumulator ``hosts`` in place.
+
+        Prefers a real MAC over a blank one and keeps the first hostname /
+        vendor learned, so a later mDNS hostname enriches a DHCP record (and
+        vice versa) for the same IP.
+        """
+        current = hosts.get(ip)
+        if current is None:
+            hosts[ip] = dict(meta)
+            return
+        new_mac = (meta.get('mac') or '').strip()
+        if (new_mac and new_mac != '00:00:00:00:00:00'
+                and not (current.get('mac') or '').strip()):
+            current['mac'] = new_mac
+        if meta.get('hostname') and not current.get('hostname'):
+            current['hostname'] = meta['hostname']
+        if meta.get('vendor') and not current.get('vendor'):
+            current['vendor'] = meta['vendor']
+        sources = set(filter(None, [current.get('source'), meta.get('source')]))
+        if sources:
+            current['source'] = '+'.join(sorted(sources))
+
+    def _passive_merge_to_db(self, hosts):
+        """Write passively discovered hosts to SQLite, mirroring run_arp_scan.
+
+        ``hosts`` maps ``ip -> {mac, vendor, hostname, source}``. Hosts without
+        a real MAC (typical for mDNS) reuse an existing real MAC for that IP, or
+        else a deterministic pseudo-MAC. Blacklisted hosts are skipped. Returns
+        the number of hosts written.
+        """
+        written = 0
+        for ip, data in hosts.items():
+            try:
+                if not self._is_valid_ip(ip):
+                    continue
+                mac = (data.get('mac') or '').lower().strip()
+                source = data.get('source', 'passive')
+                if not self._is_valid_mac(mac) or mac == '00:00:00:00:00:00':
+                    existing = None
+                    try:
+                        existing = self.db.get_host_by_ip(ip)
+                    except Exception:  # noqa: BLE001
+                        existing = None
+                    existing_mac = (existing or {}).get('mac', '')
+                    if existing_mac and not str(existing_mac).startswith('00:00:'):
+                        mac = existing_mac
+                    else:
+                        mac = self._pseudo_mac_for_ip(ip)
+                if not mac:
+                    continue
+                if self.blacklistcheck and (
+                        mac in self.mac_scan_blacklist or ip in self.ip_scan_blacklist):
+                    self.logger.debug(
+                        f"Skipping blacklisted host {ip} ({mac}) in passive discovery")
+                    continue
+                upsert_kwargs = {'mac': mac, 'ip': ip}
+                if data.get('vendor'):
+                    upsert_kwargs['vendor'] = data['vendor']
+                if data.get('hostname'):
+                    upsert_kwargs['hostname'] = data['hostname']
+                self.db.upsert_host(**upsert_kwargs)
+                try:
+                    self.db.update_ping_status(mac, success=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.db.add_scan_history(mac, ip, f'passive_{source}')
+                written += 1
+            except Exception as e:  # noqa: BLE001
+                self.logger.debug(f"Passive merge failed for {ip}: {e}")
+        if written:
+            self.logger.info(
+                f"✅ Passive discovery wrote {written} host(s) to database")
+        return written
+
+    # ---- listeners + capture loop -------------------------------------
+
+    def _open_mdns_listener(self):
+        """Open a non-blocking UDP socket joined to the mDNS group (listen only).
+
+        Returns the socket, or None if it cannot bind (e.g. no privileges).
+        Never transmits.
+        """
+        import struct
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                 socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            sock.bind(('', self.MDNS_PORT))
+            mreq = struct.pack('4sl', socket.inet_aton(self.MDNS_GROUP),
+                               socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            sock.setblocking(False)
+            return sock
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Could not open mDNS listener: {e}")
+            return None
+
+    def _open_dhcp_listener(self, port):
+        """Open a non-blocking UDP socket bound to a DHCP port (listen only).
+
+        ``port`` is 67 (server, catches Requests) or 68 (client, catches ACKs).
+        Returns the socket, or None if it cannot bind. Never transmits.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                 socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except (AttributeError, OSError):
+                pass
+            sock.bind(('', port))
+            sock.setblocking(False)
+            return sock
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Could not open DHCP listener on port {port}: {e}")
+            return None
+
+    def _ingest_passive_packet(self, sock, data, hosts):
+        """Classify one observed UDP payload by its listening port and fold it
+        into ``hosts``. mDNS on 5353, DHCP on 67/68."""
+        try:
+            port = sock.getsockname()[1]
+        except Exception:  # noqa: BLE001
+            port = 0
+        try:
+            if port == self.MDNS_PORT:
+                for ip, meta in self._mdns_hosts_from_packet(data).items():
+                    self._merge_passive_host(hosts, ip, meta)
+            elif port in (67, 68):
+                result = self._dhcp_host_from_packet(data)
+                if result:
+                    ip, meta = result
+                    self._merge_passive_host(hosts, ip, meta)
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Passive ingest error: {e}")
+
+    def passive_discover(self, duration=None, _sockets=None):
+        """Passively observe mDNS + DHCP traffic and merge discovered hosts.
+
+        Listens for ``duration`` seconds (config ``passive_discovery_duration``,
+        default 20) and only reads — it never sends a probe. Returns the
+        accumulated ``{ip: {...}}`` and writes it to the DB. ``_sockets`` is a
+        test seam; production leaves it None so the real listeners are opened.
+        """
+        import select
+        if duration is None:
+            try:
+                duration = int(self.shared_data.config.get(
+                    'passive_discovery_duration', 20))
+            except Exception:  # noqa: BLE001
+                duration = 20
+
+        hosts = {}
+        opened = []
+        socks = _sockets
+        if socks is None:
+            socks = []
+            mdns = self._open_mdns_listener()
+            if mdns is not None:
+                socks.append(mdns)
+                opened.append(mdns)
+            for dhcp_port in (67, 68):
+                dsock = self._open_dhcp_listener(dhcp_port)
+                if dsock is not None:
+                    socks.append(dsock)
+                    opened.append(dsock)
+
+        if not socks:
+            self.logger.info(
+                "Passive discovery: no listener sockets available "
+                "(needs privileges); skipping")
+            return hosts
+
+        self.logger.info(
+            f"📡 Passive discovery listening for {duration}s "
+            f"(mDNS + DHCP, no probes sent)")
+        deadline = time.time() + max(1, int(duration))
+        try:
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    readable, _, _ = select.select(socks, [], [],
+                                                   min(1.0, remaining))
+                except Exception:  # noqa: BLE001
+                    break
+                for sock in readable:
+                    try:
+                        data, _addr = sock.recvfrom(65535)
+                    except (BlockingIOError, OSError):
+                        continue
+                    if data:
+                        self._ingest_passive_packet(sock, data, hosts)
+        finally:
+            for sock in opened:
+                try:
+                    sock.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if hosts:
+            self._passive_merge_to_db(hosts)
+            self.logger.info(
+                f"📡 Passive discovery complete: {len(hosts)} host(s) observed")
+        else:
+            self.logger.info("📡 Passive discovery complete: no hosts observed")
+        return hosts
+
+    # ------------------------------------------------------------------
     # IP range host-discovery sweep (Hosts tab "IP Range Scan")
     # ------------------------------------------------------------------
     # A single ping/ARP round over a bounded range; no port scan. Bounded so a
@@ -922,6 +1355,15 @@ class NetworkScanner:
                     return {}
 
             self.logger.info(f"🚀 Initial ping sweep requested across {', '.join(target_cidrs)}")
+            # Optional passive pre-pass: observe mDNS + DHCP (no probes) to
+            # seed the host store before the active ARP/ping sweep. Off by
+            # default so existing installs keep current behavior; opt in via
+            # config 'passive_discovery_enabled'.
+            try:
+                if self.shared_data.config.get('passive_discovery_enabled', False):
+                    self.passive_discover()
+            except Exception as passive_error:  # noqa: BLE001
+                self.logger.debug(f"Passive discovery skipped: {passive_error}")
             arp_hosts = self.run_arp_scan(network=network) if include_arp_scan else {}
             ping_results = self._ping_sweep_missing_hosts(
                 arp_hosts,
